@@ -1,0 +1,12 @@
+# 보안 토큰 및 개인 설정 (절대 Git에 올라가지 않음)
+.env
+state.json
+scripts/state.json
+
+# 캡처 이미지 및 런타임 캐시
+captures/
+*.png
+*.jpg
+*.log
+__pycache__/
+.DS_Store
