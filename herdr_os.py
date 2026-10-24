@@ -77,7 +77,6 @@ ROLE_PRESETS: List[Tuple[str, str, str]] = [
     ("총괄 기획 팀장", "agy", "팀 전체 업무 기획, 하위 직원(창) 업무 분배 및 최종 결과물 검수를 담당합니다."),
     ("수석 리서처", "claude", "심층 자료 조사, 레퍼런스 수집, 팩트체크 및 핵심 요약을 담당합니다."),
     ("수석 개발자", "codex", "코드 설계, 구현, 버그 수정 및 자동화 테스트 작성을 담당합니다."),
-    ("수석 UI/UX 디자이너", "agy", "직관적인 정보 구조(IA), UI/UX 프로토타입, 디자인 시스템 및 디자인 토큰 명세를 담당합니다."),
     ("콘텐츠 작가", "claude", "보고서, 기획서, 기술 문서 및 카피라이팅 초안 작성을 담당합니다."),
     ("품질 검수자", "codex", "결과물 품질 검증, 코드 리뷰, 엣지 케이스 점검 및 개선안 도출을 담당합니다."),
 ]
@@ -1512,7 +1511,9 @@ HERMES_UI_HTML = r"""<!DOCTYPE html>
       background: var(--bg);
       color: var(--text);
       display: flex;
+      width: 100%;
       min-height: 100vh;
+      overflow-x: hidden;
     }
     .sidebar {
       width: 280px;
@@ -1579,11 +1580,14 @@ HERMES_UI_HTML = r"""<!DOCTYPE html>
     }
     .main {
       flex: 1;
-      padding: 28px 34px;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+      padding: 28px 36px;
       overflow-y: auto;
-      max-width: 1380px;
     }
     .topbar {
+      width: 100%;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -1607,9 +1611,9 @@ HERMES_UI_HTML = r"""<!DOCTYPE html>
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
     .dot.off { background: var(--red); }
     .tab-pane { display: none; }
-    .tab-pane.active { display: block; }
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    .grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+    .tab-pane.active { display: block; width: 100%; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; width: 100%; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 16px; width: 100%; }
     .card {
       background: var(--bg-card);
       border: 1px solid var(--border);
@@ -1758,7 +1762,7 @@ HERMES_UI_HTML = r"""<!DOCTYPE html>
     <button class="nav-btn" onclick="switchTab('tab-doctor', this)">🔄 초기화 / 진단 (Reset)</button>
 
     <div class="sidebar-footer">
-      <div><strong>Zero-Dependency Engine</strong></div>
+      <div><strong>uv VirtualEnv Engine (.venv)</strong></div>
       <div id="sidebar-stats" style="margin-top:6px;">로딩 중...</div>
     </div>
   </aside>
@@ -3139,44 +3143,6 @@ def build_parser() -> argparse.ArgumentParser:
     gws_parser = gw_sub.add_parser("start", help="메신저 브릿지 데몬 시작 (gateways/messenger_bridge.py)")
     gws_parser.add_argument("extra", nargs=argparse.REMAINDER, help="브릿지 스크립트에 전달할 추가 인자")
 
-    # 7. ui / dashboard (Web Control Console)
-    for ui_cmd in ("ui", "dashboard"):
-        ui_parser = subparsers.add_parser(
-            ui_cmd,
-            help="헤르메스 스타일 웹 관리 콘솔 UI 실행 (브라우저에서 스킬/팀/기억/메신저 클릭 관리)",
-        )
-        ui_parser.add_argument("--host", default="127.0.0.1", help="웹 콘솔 바인딩 호스트 (기본: 127.0.0.1)")
-        ui_parser.add_argument("--port", type=int, default=8765, help="웹 콘솔 포트 번호 (기본: 8765)")
-        ui_parser.add_argument("--no-browser", action="store_true", help="브라우저 자동 열기 비활성화")
-
-    # 8. menu / tui (Interactive Terminal Menu)
-    for menu_cmd in ("menu", "tui"):
-        subparsers.add_parser(
-            menu_cmd,
-            help="터미널 대화형 통합 제어 메뉴(TUI) 실행 (인자 없이 실행 시 기본 동작)",
-        )
-
-    # 9. reset (Clean State Reset)
-    reset_parser = subparsers.add_parser(
-        "reset",
-        help="모든 런타임 팀(teams/*), 장착 스킬(skills/*), 기억장을 비우고 순수 초기 상태(Clean State)로 리셋",
-    )
-    reset_parser.add_argument("--yes", "--force", "-y", dest="yes", action="store_true", help="확인 질문 없이 즉시 초기화")
-    reset_parser.add_argument("--include-env", "--reset-env", dest="include_env", action="store_true", help=".env 메신저 설정까지 함께 초기화")
-
-    # 10. status (alias for doctor) & role assign (compatibility alias)
-    subparsers.add_parser("status", help="시스템 상태 점검 (doctor와 동일)")
-
-    role_parser = subparsers.add_parser("role", help="창(Pane)에 표준 직책 프리셋 배정")
-    role_sub = role_parser.add_subparsers(dest="role_cmd", help="role 하위 명령")
-    ra_parser = role_sub.add_parser("assign", help="특정 창에 직책과 임무 부여")
-    ra_parser.add_argument("--pane", required=True, help="대상 창 ID (예: w1:p2)")
-    ra_parser.add_argument("--role", required=True, help="직책 이름 또는 코드")
-    ra_parser.add_argument("--agent", default="claude", help="사용할 AI 엔진")
-    ra_parser.add_argument("--mission", default="", help="핵심 임무 설명")
-    ra_parser.add_argument("--team", default=None, help="소속 부서 이름")
-    ra_parser.add_argument("--launch", action="store_true", help="배정 후 즉시 AI 실행")
-
     return parser
 
 
@@ -3184,15 +3150,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command is None or args.command in ("menu", "tui"):
-        return interactive_terminal_menu()
-    if args.command in ("ui", "dashboard"):
-        return cmd_ui(args)
-    if args.command == "reset":
-        return cmd_reset(args)
     if args.command == "setup":
         return cmd_setup(args)
-    if args.command in ("doctor", "status"):
+    if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "team":
         if args.team_cmd == "create":
@@ -3207,20 +3167,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.emp_cmd == "prompt":
             return cmd_employee_prompt(args)
         parser.parse_args(["employee", "--help"])
-        return 0
-    if args.command == "role":
-        if args.role_cmd == "assign":
-            mission = args.mission or f"{args.role}로서 배정된 과제를 수행하고 TEAM_MEMORY.md에 핵심 요약을 기록합니다."
-            assign_employee_to_pane(
-                pane_id=args.pane,
-                role_name=args.role,
-                agent_name=args.agent,
-                mission=mission,
-                team_name=args.team,
-                launch=bool(args.launch),
-            )
-            return 0
-        parser.parse_args(["role", "--help"])
         return 0
     if args.command == "skill":
         if args.skill_cmd == "list":
