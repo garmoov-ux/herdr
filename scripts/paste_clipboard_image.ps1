@@ -2,7 +2,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
-$captureDir = "F:\herdr\captures"
+$rootDir = Split-Path -Parent $PSScriptRoot
+$captureDir = Join-Path $rootDir "captures"
 if (-not (Test-Path $captureDir)) {
     New-Item -ItemType Directory -Force -Path $captureDir | Out-Null
 }

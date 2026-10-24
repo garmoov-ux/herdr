@@ -1,12 +1,14 @@
 @echo off
 chcp 65001 > nul
-title AgenticOS Launcher (Herdr + Telegram + Pixel Agents)
+title Herdr x Hermes Multi-Messenger Bridge (Telegram / Slack / Discord)
 set "PATH=%USERPROFILE%\.local\bin;%PATH%"
-cd /d "F:\herdr"
+cd /d "%~dp0"
 
-echo [1/2] Pixel Agents 가상 오피스 서버 시작 중 (포트 8089)...
-start "Pixel Agents Office" cmd /c "set PATH=%USERPROFILE%\.local\bin;%PATH% && cd /d F:\herdr && pixel-agents --port 8089"
+echo ============================================================
+echo   Herdr x Hermes CLI AgenticOS - Multi-Messenger Bridge
+echo   Working Directory: %~dp0
+echo ============================================================
+echo.
 
-echo [2/2] Herdr 텔레그램 브릿지 시작 중...
-python "F:\herdr\scripts\herdr_telegram_bridge.py"
+python "%~dp0gateways\messenger_bridge.py"
 pause
