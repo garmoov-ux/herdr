@@ -49,36 +49,52 @@
 
 ---
 
-## 🚀 1분 퀵스타트 (새 PC에서 설치 및 실행)
+## 🚀 1분 퀵스타트 (`uv` 가상환경 + 헤르메스 관리 콘솔 UI)
+
+> **초기 클론 시 100% 깨끗한 초기값(Zero-State) 보장**: 처음 `git clone` 했을 때는 어떤 팀(`teams/`), 기억(`memory/`), 스킬(`skills/`)도 강제로 등록되어 있지 않습니다. 아래 **웹 관리 콘솔 UI(`uv run herdr-os ui`)** 또는 **대화형 터미널 메뉴(`uv run herdr-os`)**에서 클릭/번호 선택만으로 원하는 스킬과 팀·직원을 자유롭게 구성하세요!
 
 ### 🪟 Windows (PowerShell)
 ```powershell
 # 1. 저장소 복제 및 폴더 이동
-git clone <저장소-URL> herdr-agentic-os
-cd herdr-agentic-os
+git clone https://github.com/garmoov-ux/herdr.git
+cd herdr
 
-# 2. 원클릭 설치 실행 (Herdr 설치 확인 + .env 생성 + Alt+V 단축키 등록 + 초기 세팅)
+# 2. uv 가상환경(.venv) 동기화 및 원클릭 설치
+uv sync
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 
-# 3. (선택) .env 파일에 Telegram / Slack / Discord 봇 토큰 입력 후 브릿지 실행
-.\start_all.bat
+# 3. 명령어 입력 없이 [헤르메스 스타일 웹 관리 콘솔 UI] 실행 (http://127.0.0.1:8765)
+uv run herdr-os ui
+
+# 또는 [터미널 대화형 메뉴(TUI)] 실행
+uv run herdr-os
 ```
 
 ### 🍎 macOS / 🐧 Linux (Bash / Zsh)
 ```bash
 # 1. 저장소 복제 및 폴더 이동
-git clone <저장소-URL> herdr-agentic-os
-cd herdr-agentic-os
+git clone https://github.com/garmoov-ux/herdr.git
+cd herdr
 
-# 2. 원클릭 설치 실행
-chmod +x ./install.sh
-./install.sh
+# 2. uv 가상환경(.venv) 동기화 및 원클릭 설치
+uv sync
+chmod +x ./install.sh && ./install.sh
 
-# 3. (선택) .env 편집 후 메신저 브릿지 실행
-python3 ./gateways/messenger_bridge.py
+# 3. 헤르메스 스타일 웹 관리 콘솔 UI 실행 (http://127.0.0.1:8765)
+uv run herdr-os ui
 ```
 
-> 💡 이미 `herdr`가 설치되어 있다면 언제든 `python ./herdr_os.py setup` 명령만으로 초기 환경을 구성하거나 복구할 수 있습니다.
+---
+
+## 🎛️ 헤르메스 스타일 관리 콘솔 UI (`uv run herdr-os ui`)
+
+명령어를 일일이 외우거나 타이핑할 필요 없이, 브라우저(`http://127.0.0.1:8765`) 또는 터미널 메뉴(`uv run herdr-os`)에서 모든 기능을 클릭으로 관리할 수 있습니다:
+
+1. **🧩 스킬 허브 (Skills Hub)**: 내장 스킬 카탈로그(`templates/skills/`)에서 **원클릭 장착/해제**, 새 커스텀 스킬 생성, 웹 에디터에서 `SKILL.md` 즉시 수정 및 삭제
+2. **🏢 팀 & 직원 배치 (Teams & Employees)**: 부서 이름 입력 후 드롭다운에서 직책(`총괄팀장`, `수석개발자`, `UI디자이너`, `수석리서처`, `콘텐츠작가`, `품질검수자`)과 AI 엔진(`agy`, `claude`, `codex`)을 골라 **원클릭으로 Herdr 창 분할 + 사원증 발급 + 업무 지시 전송**
+3. **🧠 기억 & 헌법 편집기 (Memory & Brain)**: `USER_PROFILE.md`, `COMPANY_MEMORY.md`, `AGENTS.md` 및 부서별 `TEAM_MEMORY.md`를 웹 에디터에서 바로 열람·수정
+4. **💬 멀티 메신저 설정 (Messenger Gateway)**: Telegram, Slack, Discord 봇 토큰(`.env`) 입력 및 저장
+5. **🔄 순수 초기값 리셋 (Factory Reset)**: 언제든 `uv run herdr-os reset` 또는 웹 UI의 **[초기값으로 전체 리셋]** 버튼 하나로 처음 클론했을 때의 깨끗한 초기 상태로 즉시 되돌리기
 
 ---
 

@@ -7,6 +7,7 @@ Uses only the Python 3 standard library.
 
 import argparse
 import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import platform
@@ -14,6 +15,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import urllib.parse
+import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -30,6 +34,9 @@ ROOT_DIR = Path(__file__).resolve().parent
 MEMORY_DIR = ROOT_DIR / "memory"
 TEAMS_DIR = ROOT_DIR / "teams"
 SKILLS_DIR = ROOT_DIR / "skills"
+TEMPLATES_DIR = ROOT_DIR / "templates"
+ROLE_TEMPLATES_DIR = TEMPLATES_DIR / "roles"
+SKILL_TEMPLATES_DIR = TEMPLATES_DIR / "skills"
 GATEWAYS_DIR = ROOT_DIR / "gateways"
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 CAPTURES_DIR = ROOT_DIR / "captures"
@@ -67,11 +74,12 @@ SUPPORTED_AGENTS: Dict[str, Optional[str]] = {
 
 # Built-in Role Presets for Teams & Employees
 ROLE_PRESETS: List[Tuple[str, str, str]] = [
-    ("팀장(PM)", "agy", "팀 전체 업무 기획, 하위 직원(창) 업무 분배 및 최종 결과물 검수를 담당합니다."),
-    ("리서처", "claude", "심층 자료 조사, 레퍼런스 수집, 팩트체크 및 핵심 요약을 담당합니다."),
-    ("개발자", "codex", "코드 설계, 구현, 버그 수정 및 자동화 테스트 작성을 담당합니다."),
-    ("작가", "claude", "보고서, 기획서, 기술 문서 및 카피라이팅 초안 작성을 담당합니다."),
-    ("검수자(QA)", "codex", "결과물 품질 검증, 코드 리뷰, 엣지 케이스 점검 및 개선안 도출을 담당합니다."),
+    ("총괄 기획 팀장", "agy", "팀 전체 업무 기획, 하위 직원(창) 업무 분배 및 최종 결과물 검수를 담당합니다."),
+    ("수석 리서처", "claude", "심층 자료 조사, 레퍼런스 수집, 팩트체크 및 핵심 요약을 담당합니다."),
+    ("수석 개발자", "codex", "코드 설계, 구현, 버그 수정 및 자동화 테스트 작성을 담당합니다."),
+    ("수석 UI/UX 디자이너", "agy", "직관적인 정보 구조(IA), UI/UX 프로토타입, 디자인 시스템 및 디자인 토큰 명세를 담당합니다."),
+    ("콘텐츠 작가", "claude", "보고서, 기획서, 기술 문서 및 카피라이팅 초안 작성을 담당합니다."),
+    ("품질 검수자", "codex", "결과물 품질 검증, 코드 리뷰, 엣지 케이스 점검 및 개선안 도출을 담당합니다."),
 ]
 
 
@@ -1194,6 +1202,264 @@ description: "{desc}"
     return 0
 
 
+def install_skill_from_catalog(skill_name: str) -> Tuple[bool, str]:
+    """Copy a skill template from `templates/skills/<skill_name>/SKILL.md` into `skills/<skill_name>/SKILL.md`."""
+    safe_name = sanitize_folder_name(skill_name.strip().lower().replace(" ", "-"))
+    src_file = SKILL_TEMPLATES_DIR / safe_name / "SKILL.md"
+    if not src_file.exists():
+        return False, f"카탈로그에서 '{safe_name}' 스킬 템플릿을 찾을 수 없습니다: {src_file}"
+    dest_dir = SKILLS_DIR / safe_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / "SKILL.md"
+    disabled_file = dest_dir / "SKILL.md.disabled"
+    if disabled_file.exists():
+        disabled_file.unlink()
+    shutil.copyfile(src_file, dest_file)
+    return True, str(dest_file)
+
+
+def toggle_installed_skill(skill_name: str) -> Tuple[bool, bool, str]:
+    """Toggle an installed skill between enabled (`SKILL.md`) and disabled (`SKILL.md.disabled`)."""
+    safe_name = sanitize_folder_name(skill_name.strip())
+    s_dir = SKILLS_DIR / safe_name
+    active_f = s_dir / "SKILL.md"
+    disabled_f = s_dir / "SKILL.md.disabled"
+    if active_f.exists():
+        active_f.rename(disabled_f)
+        return True, False, f"'{safe_name}' 스킬이 비활성화(OFF) 되었습니다."
+    if disabled_f.exists():
+        disabled_f.rename(active_f)
+        return True, True, f"'{safe_name}' 스킬이 활성화(ON) 되었습니다."
+    return False, False, f"'{safe_name}' 스킬을 찾을 수 없습니다."
+
+
+def delete_installed_skill(skill_name: str) -> Tuple[bool, str]:
+    """Delete an installed skill directory from `skills/<skill_name>`."""
+    safe_name = sanitize_folder_name(skill_name.strip())
+    s_dir = SKILLS_DIR / safe_name
+    if not s_dir.exists() or not s_dir.is_dir():
+        return False, f"'{safe_name}' 스킬 폴더가 존재하지 않습니다."
+    shutil.rmtree(s_dir, ignore_errors=True)
+    return True, f"'{safe_name}' 스킬이 삭제되었습니다."
+
+
+def perform_factory_reset(reset_env: bool = False) -> dict:
+    """
+    Wipe all registered teams (`teams/*` except `.gitkeep`),
+    active skills (`skills/*` except `.gitkeep`),
+    and user/company memories (`memory/USER_PROFILE.md`, `memory/COMPANY_MEMORY.md`)
+    back to a clean 0-state.
+    """
+    removed_teams = 0
+    removed_skills = 0
+    removed_memories = 0
+
+    TEAMS_DIR.mkdir(parents=True, exist_ok=True)
+    for item in TEAMS_DIR.iterdir():
+        if item.name == ".gitkeep":
+            continue
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+            removed_teams += 1
+        else:
+            item.unlink(missing_ok=True)
+    (TEAMS_DIR / ".gitkeep").touch()
+
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    for item in SKILLS_DIR.iterdir():
+        if item.name == ".gitkeep":
+            continue
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+            removed_skills += 1
+        else:
+            item.unlink(missing_ok=True)
+    (SKILLS_DIR / ".gitkeep").touch()
+
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    for m_name in ("USER_PROFILE.md", "COMPANY_MEMORY.md"):
+        mp = MEMORY_DIR / m_name
+        if mp.exists():
+            mp.unlink(missing_ok=True)
+            removed_memories += 1
+    (MEMORY_DIR / ".gitkeep").touch()
+
+    for state_p in (ROOT_DIR / "state.json", GATEWAYS_DIR / "state.json", SCRIPTS_DIR / "state.json"):
+        if state_p.exists():
+            state_p.unlink(missing_ok=True)
+
+    if reset_env and ENV_FILE.exists():
+        ENV_FILE.unlink(missing_ok=True)
+
+    return {
+        "removed_teams": removed_teams,
+        "removed_skills": removed_skills,
+        "removed_memories": removed_memories,
+    }
+
+
+def collect_system_state() -> dict:
+    """Gather complete live state for the Hermes-style Admin Control Center UI."""
+    # 1. Herdr CLI & Workspaces & Panes
+    herdr_bin = shutil.which("herdr")
+    herdr_version = ""
+    herdr_connected = False
+    workspaces = []
+    panes = []
+    if herdr_bin:
+        _, ver_out, _ = run_herdr(["--version"])
+        herdr_version = ver_out
+        rc_ws, ws_out, _ = run_herdr(["workspace", "list"])
+        rc_p, p_out, _ = run_herdr(["pane", "list"])
+        if rc_ws == 0 and rc_p == 0:
+            herdr_connected = True
+            workspaces = parse_herdr_json(ws_out).get("result", {}).get("workspaces", [])
+            panes = parse_herdr_json(p_out).get("result", {}).get("panes", [])
+
+    # 2. Local teams & employee metadata
+    pane_meta_map: Dict[str, dict] = {}
+    local_teams: List[dict] = []
+    if TEAMS_DIR.exists():
+        for t_dir in sorted(TEAMS_DIR.iterdir()):
+            if not t_dir.is_dir() or t_dir.name.startswith("."):
+                continue
+            members = []
+            for sub in sorted(t_dir.iterdir()):
+                if not sub.is_dir():
+                    continue
+                meta_file = sub / "EMPLOYEE_META.json"
+                if meta_file.exists():
+                    try:
+                        m = json.loads(meta_file.read_text(encoding="utf-8"))
+                        members.append(m)
+                        if m.get("pane_id"):
+                            pane_meta_map[m["pane_id"]] = m
+                    except Exception:
+                        pass
+                elif (sub / "ROLE_GUIDE.md").exists():
+                    members.append(
+                        {
+                            "team_name": t_dir.name,
+                            "role_name": sub.name,
+                            "agent": "claude",
+                            "mission": "ROLE_GUIDE.md 참조",
+                            "pane_id": None,
+                            "role_dir": str(sub),
+                        }
+                    )
+            team_mem_file = t_dir / "TEAM_MEMORY.md"
+            local_teams.append(
+                {
+                    "folder": t_dir.name,
+                    "path": str(t_dir),
+                    "has_memory": team_mem_file.exists(),
+                    "members": members,
+                }
+            )
+
+    for p in panes:
+        pid = p.get("pane_id", "")
+        if pid in pane_meta_map:
+            p["assigned_meta"] = pane_meta_map[pid]
+
+    # 3. Installed Skills & Catalog Skills
+    installed_skills = []
+    if SKILLS_DIR.exists():
+        for s_dir in sorted(SKILLS_DIR.iterdir()):
+            if not s_dir.is_dir() or s_dir.name.startswith("."):
+                continue
+            active_md = s_dir / "SKILL.md"
+            disabled_md = s_dir / "SKILL.md.disabled"
+            target_md = active_md if active_md.exists() else (disabled_md if disabled_md.exists() else None)
+            if target_md:
+                s_name, s_desc = parse_skill_frontmatter(target_md)
+                content = target_md.read_text(encoding="utf-8", errors="replace")
+                installed_skills.append(
+                    {
+                        "id": s_dir.name,
+                        "name": s_name,
+                        "description": s_desc,
+                        "enabled": active_md.exists(),
+                        "path": str(target_md),
+                        "content": content,
+                    }
+                )
+
+    installed_ids = {s["id"] for s in installed_skills}
+    catalog_skills = []
+    if SKILL_TEMPLATES_DIR.exists():
+        for c_dir in sorted(SKILL_TEMPLATES_DIR.iterdir()):
+            if not c_dir.is_dir() or c_dir.name.startswith("."):
+                continue
+            c_md = c_dir / "SKILL.md"
+            if c_md.exists():
+                c_name, c_desc = parse_skill_frontmatter(c_md)
+                catalog_skills.append(
+                    {
+                        "id": c_dir.name,
+                        "name": c_name,
+                        "description": c_desc,
+                        "installed": c_dir.name in installed_ids,
+                        "content": c_md.read_text(encoding="utf-8", errors="replace"),
+                    }
+                )
+
+    # 4. Memories & Constitution
+    up_file = MEMORY_DIR / "USER_PROFILE.md"
+    cm_file = MEMORY_DIR / "COMPANY_MEMORY.md"
+    ag_file = ROOT_DIR / "AGENTS.md"
+
+    # 5. Messenger (.env)
+    env_vars = load_env_file(ENV_FILE)
+
+    # 6. Installed AI CLI Engines
+    installed_agents = detect_installed_agents()
+
+    return {
+        "root_dir": str(ROOT_DIR),
+        "os_info": f"{platform.system()} {platform.release()} (Python {sys.version.split()[0]})",
+        "herdr": {
+            "installed": bool(herdr_bin),
+            "bin_path": herdr_bin or "",
+            "version": herdr_version,
+            "connected": herdr_connected,
+            "config_path": str(get_herdr_config_path()),
+            "config_exists": get_herdr_config_path().exists(),
+        },
+        "agents": {k: {"installed": bool(v), "path": v or ""} for k, v in installed_agents.items()},
+        "role_presets": [
+            {"role": r, "agent": a, "mission": m} for (r, a, m) in ROLE_PRESETS
+        ],
+        "workspaces": workspaces,
+        "panes": panes,
+        "local_teams": local_teams,
+        "installed_skills": installed_skills,
+        "catalog_skills": catalog_skills,
+        "memory": {
+            "user_profile_exists": up_file.exists(),
+            "user_profile": up_file.read_text(encoding="utf-8", errors="replace") if up_file.exists() else "",
+            "company_memory_exists": cm_file.exists(),
+            "company_memory": cm_file.read_text(encoding="utf-8", errors="replace") if cm_file.exists() else "",
+            "agents_md_exists": ag_file.exists(),
+            "agents_md": ag_file.read_text(encoding="utf-8", errors="replace") if ag_file.exists() else "",
+        },
+        "env": {
+            "exists": ENV_FILE.exists(),
+            "ENABLED_MESSENGERS": env_vars.get("ENABLED_MESSENGERS", ""),
+            "TELEGRAM_BOT_TOKEN": env_vars.get("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_ALLOWED_CHAT_IDS": env_vars.get("TELEGRAM_ALLOWED_CHAT_IDS", ""),
+            "SLACK_BOT_TOKEN": env_vars.get("SLACK_BOT_TOKEN", ""),
+            "SLACK_APP_TOKEN": env_vars.get("SLACK_APP_TOKEN", ""),
+            "SLACK_CHANNEL_ID": env_vars.get("SLACK_CHANNEL_ID", ""),
+            "SLACK_WEBHOOK_URL": env_vars.get("SLACK_WEBHOOK_URL", ""),
+            "DISCORD_BOT_TOKEN": env_vars.get("DISCORD_BOT_TOKEN", ""),
+            "DISCORD_CHANNEL_ID": env_vars.get("DISCORD_CHANNEL_ID", ""),
+            "DISCORD_WEBHOOK_URL": env_vars.get("DISCORD_WEBHOOK_URL", ""),
+        },
+    }
+
+
+
 def cmd_gateway_start(args: argparse.Namespace) -> int:
     """Handler for `gateway start`: launches `gateways/messenger_bridge.py`."""
     gw_script = GATEWAYS_DIR / "messenger_bridge.py"
@@ -1212,6 +1478,1574 @@ def cmd_gateway_start(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n🛑 메신저 게이트웨이가 종료되었습니다.")
         return 0
+
+
+# =====================================================================
+# Hermes-style Web Admin Control Center UI (`herdr_os.py ui`)
+# =====================================================================
+
+HERMES_UI_HTML = r"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Herdr × Hermes — Admin Control Center</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --bg-sidebar: #111622;
+      --bg-card: #161c2a;
+      --bg-input: #0e131d;
+      --border: #252f42;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #f59e0b;
+      --accent-hover: #d97706;
+      --blue: #3b82f6;
+      --green: #10b981;
+      --red: #ef4444;
+      --purple: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Malgun Gothic", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      min-height: 100vh;
+    }
+    .sidebar {
+      width: 280px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 20px 14px;
+      flex-shrink: 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 10px 20px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
+    }
+    .brand-logo {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #f59e0b, #ef4444);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      font-weight: bold;
+    }
+    .brand-title { font-size: 16px; font-weight: 700; color: #fff; }
+    .brand-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+    .nav-btn {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      color: var(--text-muted);
+      border: 1px solid transparent;
+      padding: 12px 14px;
+      border-radius: 9px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+      transition: all 0.15s;
+    }
+    .nav-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+    .nav-btn.active {
+      background: rgba(245, 158, 11, 0.14);
+      color: var(--accent);
+      border-color: rgba(245, 158, 11, 0.35);
+    }
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .main {
+      flex: 1;
+      padding: 28px 34px;
+      overflow-y: auto;
+      max-width: 1380px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar h1 { font-size: 22px; font-weight: 700; }
+    .topbar p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 13px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .dot.off { background: var(--red); }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .card-title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .card-desc { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.5; }
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; }
+    input[type="text"], input[type="password"], select, textarea {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-family: inherit;
+      margin-bottom: 12px;
+    }
+    textarea { min-height: 90px; resize: vertical; font-family: "Consolas", "Monaco", monospace; line-height: 1.5; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 9px 15px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn:hover { border-color: var(--text-muted); background: rgba(255,255,255,0.06); }
+    .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); }
+    .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    .btn-blue { background: var(--blue); color: #fff; border-color: var(--blue); }
+    .btn-green { background: var(--green); color: #000; border-color: var(--green); }
+    .btn-danger { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); }
+    .btn-danger:hover { background: var(--red); color: #fff; }
+    .btn-sm { padding: 6px 10px; font-size: 12px; }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(59, 130, 246, 0.16);
+      color: #93c5fd;
+    }
+    .badge.green { background: rgba(16, 185, 129, 0.16); color: #6ee7b7; }
+    .badge.amber { background: rgba(245, 158, 11, 0.16); color: #fcd34d; }
+    .badge.gray { background: rgba(139, 148, 158, 0.16); color: #9ca3af; }
+    .slot-row {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .slot-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 0.9fr auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .pane-item {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 13px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .pane-item:hover, .pane-item.selected { border-color: var(--accent); }
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid var(--accent);
+      color: #fff;
+      padding: 13px 18px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      display: none;
+      z-index: 9999;
+    }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 92%;
+      max-width: 760px;
+      padding: 24px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .empty-box {
+      text-align: center;
+      padding: 28px 16px;
+      color: var(--text-muted);
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">⚡</div>
+      <div>
+        <div class="brand-title">Herdr × Hermes</div>
+        <div class="brand-sub">AgenticOS Admin Control Center</div>
+      </div>
+    </div>
+
+    <button class="nav-btn active" onclick="switchTab('tab-teams', this)">🏢 팀 &amp; 직원 배치</button>
+    <button class="nav-btn" onclick="switchTab('tab-skills', this)">⚡ 스킬 매니저 (Skills Hub)</button>
+    <button class="nav-btn" onclick="switchTab('tab-memory', this)">🧠 기억장 &amp; 헌법 (Brain)</button>
+    <button class="nav-btn" onclick="switchTab('tab-messenger', this)">💬 메신저 게이트웨이</button>
+    <button class="nav-btn" onclick="switchTab('tab-doctor', this)">🔄 초기화 / 진단 (Reset)</button>
+
+    <div class="sidebar-footer">
+      <div><strong>Zero-Dependency Engine</strong></div>
+      <div id="sidebar-stats" style="margin-top:6px;">로딩 중...</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>Hermes Agent Control Center</h1>
+        <p>명령어 입력 없이 클릭만으로 팀(Workspace)·직원(Pane)·스킬(Skills)·기억장(Memory)·메신저를 통합 관리합니다.</p>
+      </div>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <div class="status-pill">
+          <span class="dot" id="herdr-dot"></span>
+          <span id="herdr-status-text">Herdr 상태 확인 중</span>
+        </div>
+        <button class="btn btn-sm" onclick="refreshAll()">🔄 새로고침</button>
+      </div>
+    </div>
+
+    <!-- TAB 1: TEAMS & EMPLOYEES -->
+    <section id="tab-teams" class="tab-pane active">
+      <div class="grid-2">
+        <!-- Left: Create New Team -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">➕ 새 팀 만들기 (Team &amp; Pane Builder)</div>
+            <button class="btn btn-sm" onclick="addEmployeeSlot()">+ 직원 슬롯 추가</button>
+          </div>
+          <div class="card-desc">
+            부서 이름을 입력하고 직원 슬롯(프리셋 직책·AI 엔진·임무)을 구성한 뒤 버튼을 누르면, 로컬 지침서 폴더 생성과 Herdr 창 분할이 자동으로 실행됩니다.
+          </div>
+
+          <label>부서(팀) 이름</label>
+          <input type="text" id="new-team-name" placeholder="예: 마케팅기획팀, 백엔드개발팀, 유튜브제작팀" value="" />
+
+          <div style="display:flex; justify-content:space-between; align-items:center; margin: 6px 0 8px;">
+            <label style="margin:0;">소속 직원(Pane) 슬롯 구성</label>
+            <label style="margin:0; display:flex; align-items:center; gap:6px; cursor:pointer; color:var(--text);">
+              <input type="checkbox" id="new-team-launch" /> 생성 즉시 AI CLI 자동 실행
+            </label>
+          </div>
+
+          <div id="employee-slots-container"></div>
+
+          <button class="btn btn-primary" style="width:100%; margin-top:10px; padding:12px;" onclick="submitCreateTeam()">
+            🚀 팀 생성 및 Herdr 창 자동 배치
+          </button>
+        </div>
+
+        <!-- Right: Live Herdr Workspaces & Panes + 1-Click Role Assignment -->
+        <div>
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">🖥️ 실시간 Herdr 창(Pane) &amp; 등록된 팀 목록</div>
+            </div>
+            <div class="card-desc">
+              아래에서 Herdr 창(<code>w1:p1</code>, <code>w1:p2</code> 등)을 클릭하면 직책·AI 엔진을 즉시 변경하거나 업무 지시를 전송할 수 있습니다.
+            </div>
+            <div id="live-workspaces-box"></div>
+          </div>
+
+          <div class="card" id="pane-inspector-card">
+            <div class="card-header">
+              <div class="card-title">🪪 선택한 창(Pane) 직책 배정 &amp; 원클릭 지시</div>
+              <span class="badge amber" id="selected-pane-badge">창을 선택하세요</span>
+            </div>
+            <input type="hidden" id="assign-pane-id" value="" />
+            <div class="grid-2" style="gap:10px;">
+              <div>
+                <label>대상 창 ID (직접 입력 또는 위에서 클릭)</label>
+                <input type="text" id="assign-pane-input" placeholder="예: w1:p1, w1:p2" />
+              </div>
+              <div>
+                <label>직책 프리셋 선택</label>
+                <select id="assign-preset-select" onchange="onAssignPresetChange(this.value)">
+                  <option value="총괄 기획 팀장">총괄 기획 팀장 (PM)</option>
+                  <option value="수석 리서처">수석 리서처</option>
+                  <option value="수석 개발자">수석 개발자</option>
+                  <option value="콘텐츠 작가">콘텐츠 작가</option>
+                  <option value="품질 검수자">품질 검수자 (QA)</option>
+                  <option value="custom">직접 입력</option>
+                </select>
+              </div>
+            </div>
+            <div class="grid-2" style="gap:10px;">
+              <div>
+                <label>직책 이름</label>
+                <input type="text" id="assign-role-name" value="총괄 기획 팀장" />
+              </div>
+              <div>
+                <label>AI 엔진</label>
+                <select id="assign-agent">
+                  <option value="agy">agy (Antigravity CLI)</option>
+                  <option value="claude">claude (Claude Code)</option>
+                  <option value="codex">codex (OpenAI Codex)</option>
+                  <option value="opencode">opencode</option>
+                  <option value="gemini">gemini</option>
+                </select>
+              </div>
+            </div>
+            <label>핵심 임무 프롬프트 (Mission)</label>
+            <textarea id="assign-mission" style="min-height:66px;">팀 전체 업무 기획, 하위 직원(창) 업무 분배 및 최종 결과물 검수를 담당합니다.</textarea>
+            <div style="display:flex; gap:8px; margin-bottom:16px;">
+              <button class="btn btn-primary" onclick="submitAssignPane(false)">🪪 이 창에 직책·지침서 배정</button>
+              <button class="btn btn-blue" onclick="submitAssignPane(true)">▶️ 배정 후 AI 엔진 즉시 실행</button>
+            </div>
+
+            <div style="border-top:1px solid var(--border); padding-top:14px;">
+              <label>💬 선택한 창에 즉시 업무 지시 / 명령어 보내기</label>
+              <div style="display:flex; gap:8px;">
+                <input type="text" id="pane-prompt-text" placeholder="예: 주어진 주제를 조사해서 TEAM_MEMORY.md에 요약해줘" style="margin:0;" />
+                <button class="btn btn-green" style="white-space:nowrap;" onclick="submitPanePrompt()">📨 지시 전송</button>
+                <button class="btn btn-sm" style="white-space:nowrap;" onclick="readPaneScreen()">📺 화면 읽기</button>
+              </div>
+              <pre id="pane-screen-output" style="display:none; margin-top:10px; background:#07090e; padding:12px; border-radius:8px; border:1px solid var(--border); font-size:12px; max-height:220px; overflow:auto; color:#a5f3fc;"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📂 등록된 부서 폴더 현황 (<code>teams/</code>)</div>
+        </div>
+        <div id="local-teams-box"></div>
+      </div>
+    </section>
+
+    <!-- TAB 2: SKILLS HUB -->
+    <section id="tab-skills" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">⚡ 현재 장착된 활성 스킬 (Active Installed Skills — <code>skills/</code>)</div>
+            <div class="card-desc" style="margin:4px 0 0;">모든 AI 직원이 공유하는 재사용 노하우(SOP)입니다. 토글(ON/OFF), 마크다운 편집, 삭제가 가능합니다.</div>
+          </div>
+          <button class="btn btn-primary" onclick="openSkillModal('', '', '')">+ 새 커스텀 스킬 만들기</button>
+        </div>
+        <div id="installed-skills-box" class="grid-3"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📦 기본 제공 스킬 카탈로그 (Built-in Skill Catalog — <code>templates/skills/</code>)</div>
+            <div class="card-desc" style="margin:4px 0 0;">클론 직후 깨끗한 초기 상태에서 필요한 표준 스킬을 원클릭으로 즉시 장착할 수 있습니다.</div>
+          </div>
+        </div>
+        <div id="catalog-skills-box" class="grid-3"></div>
+      </div>
+    </section>
+
+    <!-- TAB 3: MEMORY & BRAIN -->
+    <section id="tab-memory" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">👤 사장님 프로필 빠른 생성기 (Quick Profile Generator)</div>
+        </div>
+        <div class="grid-3" style="margin-bottom:10px;">
+          <div>
+            <label>호칭 / 이름</label>
+            <input type="text" id="quick-owner-name" value="사장님" />
+          </div>
+          <div>
+            <label>선호 언어</label>
+            <input type="text" id="quick-owner-lang" value="한국어" />
+          </div>
+          <div>
+            <label>선호 보고 스타일</label>
+            <input type="text" id="quick-owner-style" value="비개발자도 이해하기 쉬운 핵심 요약과 명확한 근거 중심" />
+          </div>
+        </div>
+        <button class="btn btn-blue" onclick="generateQuickProfile()">✨ 프로필 &amp; 기본 기억장 자동 생성</button>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">👤 사용자(사장님) 프로필 (<code>memory/USER_PROFILE.md</code>)</div>
+            <button class="btn btn-primary btn-sm" onclick="saveMemoryDoc('user_profile')">💾 저장하기</button>
+          </div>
+          <textarea id="editor-user-profile" style="min-height:280px;" placeholder="아직 등록된 사장님 프로필이 없습니다. 위 빠른 생성기를 누르거나 직접 작성 후 저장하세요."></textarea>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🏛️ 전사 공유 기억장 (<code>memory/COMPANY_MEMORY.md</code>)</div>
+            <button class="btn btn-primary btn-sm" onclick="saveMemoryDoc('company_memory')">💾 저장하기</button>
+          </div>
+          <textarea id="editor-company-memory" style="min-height:280px;" placeholder="아직 기록된 전사 기억장이 없습니다."></textarea>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📜 전사 AI 헌법 (<code>AGENTS.md</code> — CLAUDE.md / GEMINI.md 연동)</div>
+          <button class="btn btn-primary btn-sm" onclick="saveMemoryDoc('agents_md')">💾 저장하기</button>
+        </div>
+        <textarea id="editor-agents-md" style="min-height:260px;"></textarea>
+      </div>
+    </section>
+
+    <!-- TAB 4: MESSENGER GATEWAY -->
+    <section id="tab-messenger" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">💬 멀티 메신저 게이트웨이 설정 (Telegram / Slack / Discord)</div>
+            <div class="card-desc" style="margin:4px 0 0;">봇 토큰을 입력하고 저장하면 <code>.env</code> 파일에 즉시 반영됩니다. (Git에는 절대 업로드되지 않습니다)</div>
+          </div>
+          <span class="badge" id="env-status-badge">.env 확인 중</span>
+        </div>
+
+        <label>활성화할 메신저 (쉼표 구분: telegram, slack, discord)</label>
+        <input type="text" id="env-enabled" placeholder="예: telegram,slack,discord" />
+
+        <div class="grid-3">
+          <div class="slot-row">
+            <div style="font-weight:700; margin-bottom:10px; color:#38bdf8;">✈️ Telegram 설정</div>
+            <label>Telegram Bot Token (@BotFather)</label>
+            <input type="password" id="env-tg-token" placeholder="123456:ABC-DEF..." />
+            <label>허용할 Chat ID (비워두면 첫 사용자 자동 등록)</label>
+            <input type="text" id="env-tg-chats" placeholder="예: 123456789" />
+          </div>
+
+          <div class="slot-row">
+            <div style="font-weight:700; margin-bottom:10px; color:#f472b6;">💼 Slack 설정</div>
+            <label>Slack Bot Token (xoxb-...)</label>
+            <input type="password" id="env-slack-bot" placeholder="xoxb-..." />
+            <label>Slack Channel ID</label>
+            <input type="text" id="env-slack-channel" placeholder="C0123456789" />
+            <label>Slack Webhook URL (선택)</label>
+            <input type="text" id="env-slack-webhook" placeholder="https://hooks.slack.com/..." />
+          </div>
+
+          <div class="slot-row">
+            <div style="font-weight:700; margin-bottom:10px; color:#a78bfa;">🎮 Discord 설정</div>
+            <label>Discord Bot Token</label>
+            <input type="password" id="env-discord-bot" placeholder="Discord Bot Token" />
+            <label>Discord Channel ID</label>
+            <input type="text" id="env-discord-channel" placeholder="123456789012345678" />
+            <label>Discord Webhook URL (선택)</label>
+            <input type="text" id="env-discord-webhook" placeholder="https://discord.com/api/webhooks/..." />
+          </div>
+        </div>
+
+        <div style="display:flex; gap:10px; margin-top:12px;">
+          <button class="btn btn-primary" onclick="saveMessengerEnv()">💾 설정 저장 (.env)</button>
+          <button class="btn btn-blue" onclick="startBridgeProcess()">📡 메신저 브릿지 백그라운드 시작</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: DOCTOR & FACTORY RESET -->
+    <section id="tab-doctor" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🩺 실시간 시스템 진단 (Doctor Checklist)</div>
+            <button class="btn btn-sm" onclick="configureHerdrHooks()">⚡ Herdr 단축키 &amp; AI 훅 자동 연결</button>
+          </div>
+          <div id="doctor-checklist-box"></div>
+        </div>
+
+        <div class="card" style="border-color: rgba(239, 68, 68, 0.4);">
+          <div class="card-header">
+            <div class="card-title" style="color:#fca5a5;">🔄 초기값으로 전체 리셋 (Factory Reset)</div>
+          </div>
+          <div class="card-desc">
+            처음 <code>git clone</code> 했을 때와 동일하게 <strong>등록된 모든 팀(<code>teams/*</code>), 장착된 스킬(<code>skills/*</code>), 사용자 프로필 및 전사 기억장(<code>memory/USER_PROFILE.md</code>, <code>COMPANY_MEMORY.md</code>)을 깨끗한 0-상태로 초기화</strong>합니다.<br/><br/>
+            ※ <code>templates/roles/</code> 직무 템플릿과 <code>templates/skills/</code> 기본 스킬 카탈로그는 안전하게 보존되므로 언제든 다시 원클릭 장착할 수 있습니다.
+          </div>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; color:var(--text); margin-bottom:16px;">
+            <input type="checkbox" id="reset-include-env" /> <code>.env</code> 메신저 토큰 설정 파일도 함께 삭제
+          </label>
+          <button class="btn btn-danger" style="width:100%; padding:13px;" onclick="runFactoryReset()">
+            🗑️ 초기값으로 전체 리셋 (Factory Reset 실행)
+          </button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- SKILL CREATE / EDIT MODAL -->
+  <div class="modal-backdrop" id="skill-modal">
+    <div class="modal">
+      <div class="card-header">
+        <div class="card-title" id="skill-modal-title">⚡ 스킬 작성 / 편집</div>
+        <button class="btn btn-sm" onclick="closeSkillModal()">✕ 닫기</button>
+      </div>
+      <label>스킬 ID (폴더명, 영문 소문자/하이픈 권장)</label>
+      <input type="text" id="modal-skill-id" placeholder="예: youtube-script-writer" />
+      <label>스킬 한 줄 설명 (Description)</label>
+      <input type="text" id="modal-skill-desc" placeholder="예: 유튜브 영상 기획 및 대본 작성 표준 절차서" />
+      <label>SKILL.md 상세 마크다운 지침 (Instructions)</label>
+      <textarea id="modal-skill-content" style="min-height:280px;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:10px;">
+        <button class="btn" onclick="closeSkillModal()">취소</button>
+        <button class="btn btn-primary" onclick="saveSkillFromModal()">💾 스킬 저장</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let APP_STATE = null;
+    const PRESET_MAP = {
+      "총괄 기획 팀장": { agent: "agy", mission: "팀 전체 업무 기획, 하위 직원(창) 업무 분배 및 최종 결과물 검수를 담당합니다." },
+      "수석 리서처": { agent: "claude", mission: "심층 자료 조사, 레퍼런스 수집, 팩트체크 및 핵심 요약을 담당합니다." },
+      "수석 개발자": { agent: "codex", mission: "코드 설계, 구현, 버그 수정 및 자동화 테스트 작성을 담당합니다." },
+      "콘텐츠 작가": { agent: "claude", mission: "보고서, 기획서, 기술 문서 및 카피라이팅 초안 작성을 담당합니다." },
+      "품질 검수자": { agent: "codex", mission: "결과물 품질 검증, 코드 리뷰, 엣지 케이스 점검 및 개선안 도출을 담당합니다." }
+    };
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      clearTimeout(window._toastTimer);
+      window._toastTimer = setTimeout(() => { t.style.display = 'none'; }, 3500);
+    }
+
+    function switchTab(tabId, btn) {
+      document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById(tabId).classList.add('active');
+      if (btn) btn.classList.add('active');
+    }
+
+    async function apiPost(path, body) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+      });
+      return await res.json();
+    }
+
+    function addEmployeeSlot(presetName = "총괄 기획 팀장", agent = "", mission = "") {
+      const container = document.getElementById('employee-slots-container');
+      const idx = container.children.length + 1;
+      const info = PRESET_MAP[presetName] || { agent: "claude", mission: "" };
+      const finalAgent = agent || info.agent;
+      const finalMission = mission || info.mission;
+
+      const div = document.createElement('div');
+      div.className = 'slot-row';
+      div.innerHTML = `
+        <div class="slot-grid">
+          <div>
+            <label>직책 프리셋 (p${idx})</label>
+            <select class="slot-preset" onchange="onSlotPresetChange(this)">
+              <option value="총괄 기획 팀장" ${presetName==='총괄 기획 팀장'?'selected':''}>총괄 기획 팀장</option>
+              <option value="수석 리서처" ${presetName==='수석 리서처'?'selected':''}>수석 리서처</option>
+              <option value="수석 개발자" ${presetName==='수석 개발자'?'selected':''}>수석 개발자</option>
+              <option value="콘텐츠 작가" ${presetName==='콘텐츠 작가'?'selected':''}>콘텐츠 작가</option>
+              <option value="품질 검수자" ${presetName==='품질 검수자'?'selected':''}>품질 검수자</option>
+              <option value="직접 입력" ${!PRESET_MAP[presetName]?'selected':''}>직접 입력</option>
+            </select>
+          </div>
+          <div>
+            <label>직책명</label>
+            <input type="text" class="slot-role" value="${presetName === '직접 입력' ? '' : presetName}" placeholder="직책 입력" />
+          </div>
+          <div>
+            <label>AI 엔진</label>
+            <select class="slot-agent">
+              <option value="agy" ${finalAgent==='agy'?'selected':''}>agy</option>
+              <option value="claude" ${finalAgent==='claude'?'selected':''}>claude</option>
+              <option value="codex" ${finalAgent==='codex'?'selected':''}>codex</option>
+              <option value="opencode" ${finalAgent==='opencode'?'selected':''}>opencode</option>
+              <option value="gemini" ${finalAgent==='gemini'?'selected':''}>gemini</option>
+            </select>
+          </div>
+          <div style="padding-top:10px;">
+            <button class="btn btn-danger btn-sm" onclick="this.closest('.slot-row').remove()">삭제</button>
+          </div>
+        </div>
+        <label>세부 임무 프롬프트 (Mission)</label>
+        <input type="text" class="slot-mission" value="${finalMission}" style="margin-bottom:0;" />
+      `;
+      container.appendChild(div);
+    }
+
+    function onSlotPresetChange(sel) {
+      const row = sel.closest('.slot-row');
+      const val = sel.value;
+      if (PRESET_MAP[val]) {
+        row.querySelector('.slot-role').value = val;
+        row.querySelector('.slot-agent').value = PRESET_MAP[val].agent;
+        row.querySelector('.slot-mission').value = PRESET_MAP[val].mission;
+      } else {
+        row.querySelector('.slot-role').value = '';
+        row.querySelector('.slot-role').focus();
+      }
+    }
+
+    function onAssignPresetChange(val) {
+      if (PRESET_MAP[val]) {
+        document.getElementById('assign-role-name').value = val;
+        document.getElementById('assign-agent').value = PRESET_MAP[val].agent;
+        document.getElementById('assign-mission').value = PRESET_MAP[val].mission;
+      } else {
+        document.getElementById('assign-role-name').value = '';
+        document.getElementById('assign-role-name').focus();
+      }
+    }
+
+    function selectPaneForAssign(paneId, roleName, agent, mission) {
+      document.getElementById('assign-pane-input').value = paneId;
+      document.getElementById('selected-pane-badge').textContent = `선택됨: ${paneId}`;
+      if (roleName) document.getElementById('assign-role-name').value = roleName;
+      if (agent && agent !== '-') document.getElementById('assign-agent').value = agent;
+      if (mission) document.getElementById('assign-mission').value = mission;
+      showToast(`창 [${paneId}] 선택됨 — 우측 카드에서 직책 변경 또는 지시 전송이 가능합니다.`);
+    }
+
+    async function submitCreateTeam() {
+      const name = document.getElementById('new-team-name').value.trim();
+      if (!name) { alert('생성할 부서(팀) 이름을 입력해 주세요.'); return; }
+      const rows = document.querySelectorAll('#employee-slots-container .slot-row');
+      if (!rows.length) { alert('최소 1명의 직원 슬롯을 추가해 주세요.'); return; }
+      const roles = [];
+      rows.forEach(r => {
+        const rName = r.querySelector('.slot-role').value.trim() || '담당자';
+        const rAgent = r.querySelector('.slot-agent').value;
+        const rMission = r.querySelector('.slot-mission').value.trim();
+        roles.push({ role: rName, agent: rAgent, mission: rMission });
+      });
+      const launch = document.getElementById('new-team-launch').checked;
+      showToast(`⏳ [${name}] 팀 생성 및 Herdr 창 배치 중...`);
+      const res = await apiPost('/api/team/create', { name, roles, launch });
+      showToast(res.message || '팀 생성 완료!');
+      document.getElementById('new-team-name').value = '';
+      await refreshAll();
+    }
+
+    async function submitAssignPane(launch) {
+      const pane_id = document.getElementById('assign-pane-input').value.trim();
+      if (!pane_id) { alert('대상 창 ID(예: w1:p1, w1:p2)를 선택하거나 입력해 주세요.'); return; }
+      const role = document.getElementById('assign-role-name').value.trim() || '담당자';
+      const agent = document.getElementById('assign-agent').value;
+      const mission = document.getElementById('assign-mission').value.trim();
+      const res = await apiPost('/api/employee/assign', { pane_id, role, agent, mission, launch });
+      showToast(res.message || '직책 배정 완료!');
+      await refreshAll();
+    }
+
+    async function submitPanePrompt() {
+      const pane_id = document.getElementById('assign-pane-input').value.trim();
+      const prompt = document.getElementById('pane-prompt-text').value.trim();
+      if (!pane_id) { alert('먼저 대상 창(예: w1:p1)을 선택하세요.'); return; }
+      if (!prompt) { alert('전달할 업무 지시 내용을 입력하세요.'); return; }
+      const res = await apiPost('/api/employee/prompt', { pane_id, prompt });
+      showToast(res.message || '전송 완료');
+      document.getElementById('pane-prompt-text').value = '';
+    }
+
+    async function readPaneScreen() {
+      const pane_id = document.getElementById('assign-pane-input').value.trim();
+      if (!pane_id) { alert('먼저 대상 창(예: w1:p1)을 선택하세요.'); return; }
+      const res = await apiPost('/api/employee/read', { pane_id });
+      const pre = document.getElementById('pane-screen-output');
+      pre.style.display = 'block';
+      pre.textContent = res.output || '(화면 출력 없음 또는 Herdr 비연결)';
+    }
+
+    async function deleteTeamFolder(folder) {
+      if (!confirm(`정말 [${folder}] 부서 폴더와 지침서를 삭제하시겠습니까?`)) return;
+      const res = await apiPost('/api/team/delete', { folder });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function installCatalogSkill(id) {
+      const res = await apiPost('/api/skill/install', { id });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function toggleSkill(id) {
+      const res = await apiPost('/api/skill/toggle', { id });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function deleteSkill(id) {
+      if (!confirm(`정말 '${id}' 스킬을 삭제하시겠습니까?`)) return;
+      const res = await apiPost('/api/skill/delete', { id });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    function openSkillModal(id, desc, content) {
+      document.getElementById('modal-skill-id').value = id || '';
+      document.getElementById('modal-skill-desc').value = desc || '';
+      if (content) {
+        document.getElementById('modal-skill-content').value = content;
+      } else {
+        document.getElementById('modal-skill-content').value = `---\nname: ${id || 'custom-skill'}\ndescription: "${desc || '스킬 설명을 입력하세요'}"\n---\n\n# 🛠️ 커스텀 스킬 지침\n\n## 1. 언제 사용하는가\n- \n\n## 2. 표준 수행 절차\n1. \n2. \n`;
+      }
+      document.getElementById('skill-modal').style.display = 'flex';
+    }
+
+    function closeSkillModal() {
+      document.getElementById('skill-modal').style.display = 'none';
+    }
+
+    async function saveSkillFromModal() {
+      const id = document.getElementById('modal-skill-id').value.trim();
+      const desc = document.getElementById('modal-skill-desc').value.trim();
+      const content = document.getElementById('modal-skill-content').value;
+      if (!id) { alert('스킬 이름을 입력해 주세요.'); return; }
+      const res = await apiPost('/api/skill/save', { id, description: desc, content });
+      showToast(res.message);
+      closeSkillModal();
+      await refreshAll();
+    }
+
+    async function generateQuickProfile() {
+      const owner_name = document.getElementById('quick-owner-name').value.trim() || '사장님';
+      const preferred_lang = document.getElementById('quick-owner-lang').value.trim() || '한국어';
+      const work_style = document.getElementById('quick-owner-style').value.trim();
+      const res = await apiPost('/api/memory/generate', { owner_name, preferred_lang, work_style });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function saveMemoryDoc(target) {
+      let content = '';
+      if (target === 'user_profile') content = document.getElementById('editor-user-profile').value;
+      if (target === 'company_memory') content = document.getElementById('editor-company-memory').value;
+      if (target === 'agents_md') content = document.getElementById('editor-agents-md').value;
+      const res = await apiPost('/api/memory/save', { target, content });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function saveMessengerEnv() {
+      const payload = {
+        ENABLED_MESSENGERS: document.getElementById('env-enabled').value.trim(),
+        TELEGRAM_BOT_TOKEN: document.getElementById('env-tg-token').value.trim(),
+        TELEGRAM_ALLOWED_CHAT_IDS: document.getElementById('env-tg-chats').value.trim(),
+        SLACK_BOT_TOKEN: document.getElementById('env-slack-bot').value.trim(),
+        SLACK_CHANNEL_ID: document.getElementById('env-slack-channel').value.trim(),
+        SLACK_WEBHOOK_URL: document.getElementById('env-slack-webhook').value.trim(),
+        DISCORD_BOT_TOKEN: document.getElementById('env-discord-bot').value.trim(),
+        DISCORD_CHANNEL_ID: document.getElementById('env-discord-channel').value.trim(),
+        DISCORD_WEBHOOK_URL: document.getElementById('env-discord-webhook').value.trim(),
+      };
+      const res = await apiPost('/api/env/save', payload);
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function startBridgeProcess() {
+      const res = await apiPost('/api/gateway/start', {});
+      showToast(res.message);
+    }
+
+    async function configureHerdrHooks() {
+      const res = await apiPost('/api/doctor/configure_herdr', {});
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function runFactoryReset() {
+      const reset_env = document.getElementById('reset-include-env').checked;
+      if (!confirm('정말 모든 등록된 팀(teams/*), 장착된 스킬(skills/*), 기억장(USER_PROFILE.md, COMPANY_MEMORY.md)을 초기 상태로 리셋하시겠습니까?')) return;
+      const res = await apiPost('/api/factory_reset', { reset_env });
+      showToast(res.message);
+      await refreshAll();
+    }
+
+    async function refreshAll() {
+      const res = await fetch('/api/state');
+      APP_STATE = await res.json();
+      renderState(APP_STATE);
+    }
+
+    function renderState(st) {
+      // Topbar status
+      const dot = document.getElementById('herdr-dot');
+      const txt = document.getElementById('herdr-status-text');
+      if (st.herdr.connected) {
+        dot.className = 'dot';
+        txt.textContent = `Herdr 연결됨 (워크스페이스 ${st.workspaces.length}개 / 창 ${st.panes.length}개)`;
+      } else if (st.herdr.installed) {
+        dot.className = 'dot off';
+        txt.textContent = `Herdr 설치됨 (${st.herdr.version}) · 오프라인/세션 외부`;
+      } else {
+        dot.className = 'dot off';
+        txt.textContent = `Herdr 미설치`;
+      }
+
+      document.getElementById('sidebar-stats').innerHTML = `
+        • 등록된 팀: <strong>${st.local_teams.length}개</strong><br/>
+        • 활성 스킬: <strong>${st.installed_skills.filter(s=>s.enabled).length}개</strong><br/>
+        • 사장님 프로필: <strong>${st.memory.user_profile_exists ? '등록됨' : '미등록(초기값)'}</strong>
+      `;
+
+      // Live Workspaces & Panes
+      const wsBox = document.getElementById('live-workspaces-box');
+      if (!st.workspaces.length) {
+        wsBox.innerHTML = `<div class="empty-box">현재 활성화된 Herdr 워크스페이스가 없거나 Herdr 외부에서 실행 중입니다.<br/>좌측에서 새 팀을 생성하거나 아래에 창 ID(예: <code>w1:p1</code>)를 직접 입력해 지침서를 발급할 수 있습니다.</div>`;
+      } else {
+        wsBox.innerHTML = st.workspaces.map(ws => {
+          const wsPanes = st.panes.filter(p => p.workspace_id === ws.workspace_id);
+          const panesHtml = wsPanes.map(p => {
+            const m = p.assigned_meta || {};
+            const rName = m.role_name || p.label || '미배정 창';
+            const rAgent = m.agent || p.agent || 'claude';
+            const rMission = m.mission || '';
+            return `
+              <div class="pane-item" onclick='selectPaneForAssign(${JSON.stringify(p.pane_id)}, ${JSON.stringify(rName)}, ${JSON.stringify(rAgent)}, ${JSON.stringify(rMission)})'>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <div>
+                    <span class="badge amber">${p.pane_id}</span>
+                    <strong style="margin-left:6px;">${rName}</strong>
+                    <span class="badge" style="margin-left:6px;">AI: ${rAgent}</span>
+                  </div>
+                  <span class="badge ${p.agent_status==='running'?'green':'gray'}">${p.agent_status || 'idle'}</span>
+                </div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:6px;">
+                  ${rMission ? rMission : `경로: ${p.cwd || ''}`}
+                </div>
+              </div>
+            `;
+          }).join('');
+          return `
+            <div style="margin-bottom:14px;">
+              <div style="font-size:13px; font-weight:700; margin-bottom:8px; color:var(--accent);">
+                🏢 [${ws.workspace_id}] ${ws.label || ws.workspace_id} (창 ${wsPanes.length}개)
+              </div>
+              ${panesHtml}
+            </div>
+          `;
+        }).join('');
+      }
+
+      // Local Teams
+      const ltBox = document.getElementById('local-teams-box');
+      if (!st.local_teams.length) {
+        ltBox.innerHTML = `<div class="empty-box">등록된 팀 폴더가 없습니다 (깨끗한 초기 상태). 위 <strong>[+ 새 팀 만들기]</strong>에서 첫 부서를 생성해 보세요!</div>`;
+      } else {
+        ltBox.innerHTML = `<div class="grid-3">` + st.local_teams.map(t => `
+          <div class="slot-row">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <strong>📂 ${t.folder}</strong>
+              <button class="btn btn-danger btn-sm" onclick='deleteTeamFolder(${JSON.stringify(t.folder)})'>삭제</button>
+            </div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">직원 ${t.members.length}명 · 공유 기억장(TEAM_MEMORY.md)</div>
+            ${t.members.map(m => `
+              <div style="font-size:12px; padding:6px 8px; background:var(--bg-card); border-radius:6px; margin-bottom:5px;">
+                <span class="badge amber">${m.pane_id || '로컬'}</span>
+                <strong>${m.role_name}</strong> <span class="badge">${m.agent}</span>
+                <div style="color:var(--text-muted); margin-top:3px;">${m.mission || ''}</div>
+              </div>
+            `).join('')}
+          </div>
+        `).join('') + `</div>`;
+      }
+
+      // Installed Skills
+      const skBox = document.getElementById('installed-skills-box');
+      if (!st.installed_skills.length) {
+        skBox.style.display = 'block';
+        skBox.innerHTML = `<div class="empty-box">현재 장착된 스킬이 없습니다 (0개). 아래 <strong>기본 제공 스킬 카탈로그</strong>에서 <strong>[+ 원클릭 장착]</strong>을 눌러보세요!</div>`;
+      } else {
+        skBox.style.display = 'grid';
+        skBox.innerHTML = st.installed_skills.map(s => `
+          <div class="slot-row" style="display:flex; flex-direction:column; justify-content:space-between;">
+            <div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <strong>⚡ ${s.name}</strong>
+                <span class="badge ${s.enabled?'green':'gray'}">${s.enabled ? '활성 (ON)' : '비활성 (OFF)'}</span>
+              </div>
+              <div style="font-size:12px; color:var(--text-muted); margin-bottom:14px; line-height:1.5;">${s.description || '설명 없음'}</div>
+            </div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn btn-sm" onclick='toggleSkill(${JSON.stringify(s.id)})'>${s.enabled ? '⏸ 끄기' : '▶ 켜기'}</button>
+              <button class="btn btn-sm" onclick='openSkillModal(${JSON.stringify(s.id)}, ${JSON.stringify(s.description)}, ${JSON.stringify(s.content)})'>✏️ 마크다운 편집</button>
+              <button class="btn btn-danger btn-sm" onclick='deleteSkill(${JSON.stringify(s.id)})'>🗑 삭제</button>
+            </div>
+          </div>
+        `).join('');
+      }
+
+      // Catalog Skills
+      const catBox = document.getElementById('catalog-skills-box');
+      catBox.innerHTML = st.catalog_skills.map(c => `
+        <div class="slot-row" style="display:flex; flex-direction:column; justify-content:space-between;">
+          <div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <strong>📦 ${c.name}</strong>
+              ${c.installed ? '<span class="badge green">장착됨</span>' : '<span class="badge gray">미장착</span>'}
+            </div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:14px; line-height:1.5;">${c.description}</div>
+          </div>
+          <button class="btn ${c.installed?'':'btn-primary'} btn-sm" onclick='installCatalogSkill(${JSON.stringify(c.id)})'>
+            ${c.installed ? '🔄 초기 템플릿으로 재장착' : '➕ 원클릭 장착'}
+          </button>
+        </div>
+      `).join('');
+
+      // Memory Editors
+      document.getElementById('editor-user-profile').value = st.memory.user_profile || '';
+      document.getElementById('editor-company-memory').value = st.memory.company_memory || '';
+      document.getElementById('editor-agents-md').value = st.memory.agents_md || '';
+
+      // Messenger .env
+      document.getElementById('env-status-badge').textContent = st.env.exists ? '.env 파일 존재함' : '.env 미생성 (초기 상태)';
+      document.getElementById('env-enabled').value = st.env.ENABLED_MESSENGERS || '';
+      document.getElementById('env-tg-token').value = st.env.TELEGRAM_BOT_TOKEN || '';
+      document.getElementById('env-tg-chats').value = st.env.TELEGRAM_ALLOWED_CHAT_IDS || '';
+      document.getElementById('env-slack-bot').value = st.env.SLACK_BOT_TOKEN || '';
+      document.getElementById('env-slack-channel').value = st.env.SLACK_CHANNEL_ID || '';
+      document.getElementById('env-slack-webhook').value = st.env.SLACK_WEBHOOK_URL || '';
+      document.getElementById('env-discord-bot').value = st.env.DISCORD_BOT_TOKEN || '';
+      document.getElementById('env-discord-channel').value = st.env.DISCORD_CHANNEL_ID || '';
+      document.getElementById('env-discord-webhook').value = st.env.DISCORD_WEBHOOK_URL || '';
+
+      // Doctor Checklist
+      const agentRows = Object.entries(st.agents).map(([k, v]) =>
+        `<div style="margin-bottom:6px;">${v.installed ? '✅' : '⚪'} <strong>${k}</strong>: ${v.installed ? v.path : '미설치'}</div>`
+      ).join('');
+      document.getElementById('doctor-checklist-box').innerHTML = `
+        <div class="slot-row">
+          <div><strong>💻 운영체제 / Python:</strong> ${st.os_info}</div>
+          <div style="margin-top:6px;"><strong>📂 루트 경로:</strong> <code>${st.root_dir}</code></div>
+          <div style="margin-top:6px;"><strong>🖥️ Herdr 바이너리:</strong> ${st.herdr.installed ? `✅ ${st.herdr.bin_path} (${st.herdr.version})` : '❌ 미설치'}</div>
+          <div style="margin-top:6px;"><strong>⚙️ Herdr config.toml:</strong> ${st.herdr.config_exists ? `✅ ${st.herdr.config_path}` : '⚪ 미생성'}</div>
+        </div>
+        <div class="slot-row">
+          <div style="font-weight:700; margin-bottom:8px;">🤖 감지된 AI 에이전트 CLI</div>
+          ${agentRows}
+        </div>
+        <div class="slot-row">
+          <div style="font-weight:700; margin-bottom:8px;">📊 현재 등록 상태 요약</div>
+          <div>• 등록된 팀(<code>teams/</code>): <strong>${st.local_teams.length}개</strong></div>
+          <div>• 장착된 스킬(<code>skills/</code>): <strong>${st.installed_skills.length}개</strong> (카탈로그 템플릿 ${st.catalog_skills.length}개)</div>
+          <div>• 사장님 프로필(<code>USER_PROFILE.md</code>): <strong>${st.memory.user_profile_exists ? '✅ 존재' : '⚪ 미등록 (0-State)'}</strong></div>
+          <div>• 전사 기억장(<code>COMPANY_MEMORY.md</code>): <strong>${st.memory.company_memory_exists ? '✅ 존재' : '⚪ 미등록 (0-State)'}</strong></div>
+        </div>
+      `;
+    }
+
+    // Initialize default 3 employee slots in builder
+    window.addEventListener('DOMContentLoaded', () => {
+      addEmployeeSlot("총괄 기획 팀장");
+      addEmployeeSlot("수석 리서처");
+      addEmployeeSlot("수석 개발자");
+      refreshAll();
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+class HermesAdminHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler for the Hermes-style Admin Control Center UI."""
+
+    def log_message(self, format: str, *args) -> None:
+        # Keep terminal output clean while clicking around UI
+        pass
+
+    def _send_json(self, data: dict, status: int = 200) -> None:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_html(self, html: str) -> None:
+        raw = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self._send_html(HERMES_UI_HTML)
+            return
+        if parsed.path == "/api/state":
+            self._send_json(collect_system_state())
+            return
+        self._send_json({"error": "Not found"}, status=404)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+        try:
+            body = json.loads(raw_body) if raw_body else {}
+        except Exception:
+            body = {}
+
+        path = parsed.path
+
+        # 1. Create Team
+        if path == "/api/team/create":
+            team_name = str(body.get("name", "")).strip() or "신규부서"
+            roles_list = body.get("roles", [])
+            launch = bool(body.get("launch", False))
+            role_tuples: List[Tuple[str, str, str]] = []
+            for item in roles_list:
+                r_name = str(item.get("role", "담당자")).strip()
+                r_agent = str(item.get("agent", "claude")).strip()
+                r_mission = str(item.get("mission", "")).strip() or f"{team_name}의 {r_name} 직무 수행"
+                role_tuples.append((r_name, r_agent, r_mission))
+            ws_id = create_team(
+                team_name=team_name,
+                launch_agents=launch,
+                role_items_override=role_tuples if role_tuples else None,
+            )
+            msg = (
+                f"✅ [{team_name}] 부서 생성 및 Herdr 워크스페이스({ws_id}) 창 배치 완료!"
+                if ws_id
+                else f"📁 [{team_name}] 로컬 부서 폴더 및 직원 지침서 생성 완료! (Herdr 미실행 상태)"
+            )
+            self._send_json({"ok": True, "workspace_id": ws_id, "message": msg})
+            return
+
+        # 2. Delete Team Folder
+        if path == "/api/team/delete":
+            folder = sanitize_folder_name(str(body.get("folder", "")))
+            target = TEAMS_DIR / folder
+            if target.exists() and target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                self._send_json({"ok": True, "message": f"🗑️ [{folder}] 부서 폴더가 삭제되었습니다."})
+            else:
+                self._send_json({"ok": False, "message": "대상 부서 폴더를 찾을 수 없습니다."})
+            return
+
+        # 3. Assign Role to Existing Herdr Pane
+        if path == "/api/employee/assign":
+            pane_id = str(body.get("pane_id", "")).strip()
+            role = str(body.get("role", "담당자")).strip()
+            agent = str(body.get("agent", "claude")).strip()
+            mission = str(body.get("mission", "")).strip()
+            launch = bool(body.get("launch", False))
+            role_dir = assign_employee_to_pane(
+                pane_id=pane_id,
+                role_name=role,
+                agent_name=agent,
+                mission=mission,
+                launch=launch,
+            )
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": f"✅ 창 [{pane_id}] 직책 배정 완료: {role} ({agent}) -> {role_dir.name}",
+                }
+            )
+            return
+
+        # 4. Send Prompt / Command to Herdr Pane
+        if path == "/api/employee/prompt":
+            pane_id = str(body.get("pane_id", "")).strip()
+            prompt_txt = str(body.get("prompt", "")).strip()
+            rc, out, err = run_herdr(["pane", "run", pane_id, prompt_txt])
+            if rc == 0:
+                self._send_json({"ok": True, "message": f"📨 [{pane_id}] 창으로 지시 전송 완료!"})
+            else:
+                self._send_json({"ok": False, "message": f"⚠️ 전송 실패 (Herdr 연결 확인): {err or out}"})
+            return
+
+        # 5. Read Herdr Pane Output
+        if path == "/api/employee/read":
+            pane_id = str(body.get("pane_id", "")).strip()
+            rc, out, err = run_herdr(["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "40"])
+            self._send_json({"ok": rc == 0, "output": out if rc == 0 else (err or out)})
+            return
+
+        # 6. Install Skill from Catalog
+        if path == "/api/skill/install":
+            skill_id = str(body.get("id", "")).strip()
+            ok, info = install_skill_from_catalog(skill_id)
+            self._send_json(
+                {
+                    "ok": ok,
+                    "message": f"⚡ '{skill_id}' 스킬이 장착되었습니다!" if ok else info,
+                }
+            )
+            return
+
+        # 7. Toggle Installed Skill
+        if path == "/api/skill/toggle":
+            skill_id = str(body.get("id", "")).strip()
+            ok, enabled, msg = toggle_installed_skill(skill_id)
+            self._send_json({"ok": ok, "enabled": enabled, "message": msg})
+            return
+
+        # 8. Delete Installed Skill
+        if path == "/api/skill/delete":
+            skill_id = str(body.get("id", "")).strip()
+            ok, msg = delete_installed_skill(skill_id)
+            self._send_json({"ok": ok, "message": msg})
+            return
+
+        # 9. Save / Create Custom Skill
+        if path == "/api/skill/save":
+            raw_id = str(body.get("id", "")).strip()
+            safe_id = sanitize_folder_name(raw_id.lower().replace(" ", "-"))
+            desc = str(body.get("description", "")).strip() or f"{raw_id} 커스텀 스킬"
+            content = str(body.get("content", "")).strip()
+            s_dir = SKILLS_DIR / safe_id
+            s_dir.mkdir(parents=True, exist_ok=True)
+            if not content.startswith("---"):
+                content = f'---\nname: {safe_id}\ndescription: "{desc}"\n---\n\n{content}\n'
+            (s_dir / "SKILL.md").write_text(content + "\n", encoding="utf-8")
+            disabled_f = s_dir / "SKILL.md.disabled"
+            if disabled_f.exists():
+                disabled_f.unlink()
+            self._send_json({"ok": True, "message": f"💾 '{safe_id}' 스킬이 저장 및 활성화되었습니다!"})
+            return
+
+        # 10. Quick Generate User Profile & Company Memory
+        if path == "/api/memory/generate":
+            owner_name = str(body.get("owner_name", "사장님")).strip()
+            preferred_lang = str(body.get("preferred_lang", "한국어")).strip()
+            work_style = str(body.get("work_style", "핵심 요약 선호")).strip()
+            ensure_root_constitution()
+            generate_user_profile_and_memory(owner_name, preferred_lang, work_style, overwrite_profile=True)
+            self._send_json({"ok": True, "message": "✨ 사장님 프로필 및 전사 기억장이 생성되었습니다!"})
+            return
+
+        # 11. Save Memory or AGENTS.md
+        if path == "/api/memory/save":
+            target = str(body.get("target", "")).strip()
+            content = str(body.get("content", ""))
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            if target == "user_profile":
+                (MEMORY_DIR / "USER_PROFILE.md").write_text(content, encoding="utf-8")
+                self._send_json({"ok": True, "message": "💾 USER_PROFILE.md 저장 완료!"})
+                return
+            if target == "company_memory":
+                (MEMORY_DIR / "COMPANY_MEMORY.md").write_text(content, encoding="utf-8")
+                self._send_json({"ok": True, "message": "💾 COMPANY_MEMORY.md 저장 완료!"})
+                return
+            if target == "agents_md":
+                (ROOT_DIR / "AGENTS.md").write_text(content, encoding="utf-8")
+                self._send_json({"ok": True, "message": "💾 AGENTS.md 전사 헌법 저장 완료!"})
+                return
+            self._send_json({"ok": False, "message": "알 수 없는 문서 대상입니다."})
+            return
+
+        # 12. Save Messenger .env
+        if path == "/api/env/save":
+            env_vars = load_env_file(ENV_FILE)
+            for k in (
+                "ENABLED_MESSENGERS",
+                "TELEGRAM_BOT_TOKEN",
+                "TELEGRAM_ALLOWED_CHAT_IDS",
+                "SLACK_BOT_TOKEN",
+                "SLACK_APP_TOKEN",
+                "SLACK_CHANNEL_ID",
+                "SLACK_WEBHOOK_URL",
+                "DISCORD_BOT_TOKEN",
+                "DISCORD_CHANNEL_ID",
+                "DISCORD_WEBHOOK_URL",
+            ):
+                if k in body:
+                    env_vars[k] = str(body[k]).strip()
+            # Auto-populate ENABLED_MESSENGERS if left blank but tokens exist
+            if not env_vars.get("ENABLED_MESSENGERS"):
+                auto_en = []
+                if env_vars.get("TELEGRAM_BOT_TOKEN"):
+                    auto_en.append("telegram")
+                if env_vars.get("SLACK_BOT_TOKEN") or env_vars.get("SLACK_WEBHOOK_URL"):
+                    auto_en.append("slack")
+                if env_vars.get("DISCORD_BOT_TOKEN") or env_vars.get("DISCORD_WEBHOOK_URL"):
+                    auto_en.append("discord")
+                env_vars["ENABLED_MESSENGERS"] = ",".join(auto_en)
+            save_env_file(env_vars, ENV_FILE)
+            self._send_json({"ok": True, "message": "💾 메신저 게이트웨이 설정(.env)이 저장되었습니다!"})
+            return
+
+        # 13. Start Messenger Bridge in Background
+        if path == "/api/gateway/start":
+            gw_script = GATEWAYS_DIR / "messenger_bridge.py"
+            if not gw_script.exists():
+                self._send_json({"ok": False, "message": "gateways/messenger_bridge.py 파일이 없습니다."})
+                return
+            creationflags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+            subprocess.Popen(
+                [sys.executable, str(gw_script)],
+                cwd=str(ROOT_DIR),
+                creationflags=creationflags,
+            )
+            self._send_json({"ok": True, "message": "📡 멀티 메신저 브릿지가 새 프로세스로 시작되었습니다!"})
+            return
+
+        # 14. Configure Herdr Shortcuts & Integration Hooks
+        if path == "/api/doctor/configure_herdr":
+            cfg = configure_herdr_toml()
+            installed = detect_installed_agents()
+            hooked = []
+            if shutil.which("herdr"):
+                for ag, p in installed.items():
+                    target = SUPPORTED_AGENTS.get(ag)
+                    if p and target:
+                        rc, _, _ = run_herdr(["integration", "install", target])
+                        if rc == 0:
+                            hooked.append(ag)
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": f"⚡ Herdr 단축키({cfg.name}) 및 AI 훅({', '.join(hooked) or '없음'}) 설정 완료!",
+                }
+            )
+            return
+
+        # 15. Factory Reset
+        if path == "/api/factory_reset":
+            reset_env = bool(body.get("reset_env", False))
+            res = perform_factory_reset(reset_env=reset_env)
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": (
+                        f"🔄 초기 상태로 전체 리셋 완료! "
+                        f"(삭제된 팀: {res['removed_teams']}개, 스킬: {res['removed_skills']}개, 기억장: {res['removed_memories']}개)"
+                    ),
+                }
+            )
+            return
+
+        self._send_json({"error": "Unknown endpoint"}, status=404)
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Launch the Hermes-style Web Admin Control Center UI on http://127.0.0.1:8765."""
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    port = int(getattr(args, "port", 8765) or 8765)
+    no_open = bool(getattr(args, "no_browser", False))
+
+    url = f"http://{host}:{port}"
+    server = ThreadingHTTPServer((host, port), HermesAdminHandler)
+
+    print("=" * 68)
+    print("🌐 Herdr × Hermes Admin Control Center (웹 관리 콘솔 UI)")
+    print("=" * 68)
+    print(f"  🔗 접속 주소: {url}")
+    print("  💡 브라우저에서 팀/직원 배치, 스킬 장착, 기억장 편집, 메신저 연동, 초기화를 클릭으로 관리하세요.")
+    print("  🛑 종료하려면 터미널에서 Ctrl+C 를 누르세요.")
+    print("=" * 68)
+
+    if not no_open:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 웹 관리 콘솔 UI 서버를 종료합니다.")
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """CLI handler for Factory Reset (`herdr_os.py reset`)."""
+    force = bool(getattr(args, "yes", False))
+    if not force:
+        if not prompt_yes_no(
+            "⚠️ 정말 등록된 모든 팀(teams/*), 스킬(skills/*), 기억장(USER_PROFILE.md, COMPANY_MEMORY.md)을 초기값(0-State)으로 리셋할까요?",
+            False,
+        ):
+            print("취소되었습니다.")
+            return 0
+    res = perform_factory_reset(reset_env=bool(getattr(args, "include_env", False)))
+    print(
+        f"✅ 초기 상태(Factory Reset) 복원 완료! "
+        f"(팀 {res['removed_teams']}개, 스킬 {res['removed_skills']}개, 기억장 {res['removed_memories']}개 초기화됨)"
+    )
+    return 0
+
+
+def interactive_terminal_menu() -> int:
+    """
+    Interactive Terminal Menu TUI (`python herdr_os.py` with no args, or `herdr-os`).
+    Lets users manage everything without memorizing CLI arguments.
+    """
+    while True:
+        st = collect_system_state()
+        active_skills = len([s for s in st["installed_skills"] if s["enabled"]])
+        team_count = len(st["local_teams"])
+        profile_ok = "등록됨" if st["memory"]["user_profile_exists"] else "미등록(초기값)"
+
+        print("\n" + "=" * 72)
+        print("⚡ Herdr × Hermes AgenticOS — 대화형 통합 관리 메뉴 (Interactive Menu)")
+        print("=" * 72)
+        print(
+            f"📊 현재 상태: 등록된 팀 [{team_count}개] | 활성 스킬 [{active_skills}개] | 사장님 프로필 [{profile_ok}]"
+        )
+        print("-" * 72)
+        print("  1. 🌐 관리 콘솔 UI 열기 (Hermes-style Web Control Center - 스킬/팀/직원/기억/메신저 클릭 관리)")
+        print("  2. 🏢 팀 & 직원 관리 (새 팀 추가 / 직원 직책·역할 배정 / 현재 창 목록)")
+        print("  3. ⚡ 스킬(Skills) 관리 (스킬 카탈로그에서 원클릭 추가 / 새 스킬 작성 / 스킬 삭제)")
+        print("  4. 🧠 기억장(Memory) 관리 (사장님 프로필 / 전사 기억장 조회 및 초기화)")
+        print("  5. 💬 메신저(Telegram/Slack/Discord) 연결 설정 및 브릿지 시작")
+        print("  6. 🔄 초기 상태로 전체 리셋 (Factory Reset)")
+        print("  0. 종료 (Exit)")
+        print("=" * 72)
+
+        choice = prompt_input("원하시는 메뉴 번호를 선택하세요 (0~6)", "1")
+
+        if choice == "0" or choice.lower() in ("q", "quit", "exit"):
+            print("👋 Herdr × Hermes 관리 메뉴를 종료합니다.")
+            return 0
+
+        # 1. Web UI
+        if choice == "1":
+            return cmd_ui(argparse.Namespace(host="127.0.0.1", port=8765, no_browser=False))
+
+        # 2. Teams & Employees
+        elif choice == "2":
+            print("\n[🏢 팀 & 직원 관리]")
+            print("  1) 새 팀(부서) 만들기 및 Herdr 창 자동 배치")
+            print("  2) 기존 Herdr 창(w1:p1, w1:p2 등)에 직책·역할 배정")
+            print("  3) 특정 창 직원에게 업무 지시(프롬프트) 보내기")
+            print("  4) 현재 전체 팀 및 Herdr 창 목록 보기")
+            print("  0) 이전 메뉴로")
+            sub = prompt_input("선택", "1")
+            if sub == "1":
+                cmd_team_create(argparse.Namespace(name="", roles="", launch=False))
+            elif sub == "2":
+                cmd_team_list(argparse.Namespace())
+                pid = prompt_input("직책을 부여할 창 ID (예: w1:p1, w1:p2)", "w1:p1")
+                print("  [직책 프리셋] 1.총괄 기획 팀장(agy) 2.수석 리서처(claude) 3.수석 개발자(codex) 4.콘텐츠 작가(claude) 5.품질 검수자(codex) 6.직접 입력")
+                p_idx = prompt_input("프리셋 번호 선택 (1~6)", "1")
+                if p_idx in ("1", "2", "3", "4", "5"):
+                    r_name, r_agent, r_desc = ROLE_PRESETS[int(p_idx) - 1]
+                else:
+                    r_name = prompt_input("직책 이름 입력", "전담 매니저")
+                    r_agent = prompt_input("AI 엔진 (agy/claude/codex/opencode/gemini)", "claude")
+                    r_desc = prompt_input("핵심 임무 입력", f"{r_name} 직무를 수행합니다.")
+                launch_yn = prompt_yes_no("배정 후 즉시 AI CLI를 실행할까요?", False)
+                assign_employee_to_pane(pid, r_name, r_agent, r_desc, launch=launch_yn)
+            elif sub == "3":
+                pid = prompt_input("지시를 보낼 창 ID (예: w1:p2)", "w1:p2")
+                msg = prompt_input("전달할 업무 지시 내용")
+                if msg:
+                    cmd_employee_prompt(argparse.Namespace(pane_id=pid, instruction=[msg]))
+            elif sub == "4":
+                cmd_team_list(argparse.Namespace())
+
+        # 3. Skills Hub
+        elif choice == "3":
+            print("\n[⚡ 스킬(Skills) 관리]")
+            print("  1) 현재 장착된 스킬 및 기본 카탈로그 목록 보기")
+            print("  2) 기본 스킬 카탈로그(templates/skills/)에서 원클릭 장착")
+            print("  3) 새 커스텀 스킬 만들기")
+            print("  4) 장착된 스킬 삭제")
+            print("  0) 이전 메뉴로")
+            sub = prompt_input("선택", "2")
+            if sub == "1":
+                cmd_skill_list(argparse.Namespace())
+                print("\n📦 [기본 제공 스킬 카탈로그 (templates/skills/)]")
+                for idx, c in enumerate(st["catalog_skills"], start=1):
+                    status_str = "장착됨" if c["installed"] else "미장착"
+                    print(f"  {idx}. {c['id']:<22} [{status_str}] - {c['description']}")
+            elif sub == "2":
+                print("\n📦 [기본 제공 스킬 카탈로그]")
+                cats = st["catalog_skills"]
+                for idx, c in enumerate(cats, start=1):
+                    status_str = "✅장착됨" if c["installed"] else "⚪미장착"
+                    print(f"  {idx}. {c['id']:<22} ({status_str}) : {c['description']}")
+                print("  a. 전체 카탈로그 스킬 한 번에 모두 장착")
+                pick = prompt_input("장착할 스킬 번호 또는 'a' 입력", "a")
+                if pick.lower() == "a":
+                    for c in cats:
+                        install_skill_from_catalog(c["id"])
+                    print(f"✅ 카탈로그 스킬 {len(cats)}종이 모두 skills/ 에 장착되었습니다!")
+                else:
+                    try:
+                        c_item = cats[int(pick) - 1]
+                        ok, info = install_skill_from_catalog(c_item["id"])
+                        print(f"✅ '{c_item['id']}' 장착 완료 -> {info}" if ok else f"❌ {info}")
+                    except Exception:
+                        print("⚠️ 올바른 번호를 입력해 주세요.")
+            elif sub == "3":
+                s_name = prompt_input("새 스킬 이름 (영문 소문자/하이픈 권장, 예: blog-writer)")
+                s_desc = prompt_input("스킬 한 줄 설명")
+                if s_name:
+                    cmd_skill_create(argparse.Namespace(name=s_name, description=[s_desc]))
+            elif sub == "4":
+                inst = st["installed_skills"]
+                if not inst:
+                    print("  ℹ️ 현재 장착된 스킬이 없습니다.")
+                else:
+                    for idx, s in enumerate(inst, start=1):
+                        print(f"  {idx}. {s['id']} ({s['description']})")
+                    d_pick = prompt_input("삭제할 스킬 번호 입력")
+                    try:
+                        target_s = inst[int(d_pick) - 1]
+                        ok, msg = delete_installed_skill(target_s["id"])
+                        print(f"🗑️ {msg}")
+                    except Exception:
+                        print("⚠️ 취소되었습니다.")
+
+        # 4. Memory
+        elif choice == "4":
+            print("\n[🧠 기억장(Memory) 관리]")
+            print("  1) 사장님 프로필(USER_PROFILE.md) 및 전사 기억장(COMPANY_MEMORY.md) 생성/수정")
+            print("  2) 현재 기억장 내용 조회")
+            print("  3) 기억장만 초기 상태(0-State)로 비우기")
+            print("  0) 이전 메뉴로")
+            sub = prompt_input("선택", "1")
+            if sub == "1":
+                owner = prompt_input("사용자 이름 또는 호칭", "사장님")
+                lang = prompt_input("기본 응답 언어", "한국어")
+                style = prompt_input(
+                    "선호 업무/보고 스타일",
+                    "비개발자도 직관적으로 이해할 수 있도록 핵심 요약과 명확한 설명 선호",
+                )
+                ensure_root_constitution()
+                up_p, cm_p = generate_user_profile_and_memory(owner, lang, style, overwrite_profile=True)
+                print(f"✅ 생성 완료:\n  - {up_p}\n  - {cm_p}")
+            elif sub == "2":
+                print("\n--- [USER_PROFILE.md] ---")
+                print(st["memory"]["user_profile"] or "(비어 있음 - 미등록 상태)")
+                print("\n--- [COMPANY_MEMORY.md] ---")
+                print(st["memory"]["company_memory"] or "(비어 있음 - 미등록 상태)")
+            elif sub == "3":
+                for fn in ("USER_PROFILE.md", "COMPANY_MEMORY.md"):
+                    p = MEMORY_DIR / fn
+                    if p.exists():
+                        p.unlink()
+                print("🗑️ 기억장(USER_PROFILE.md, COMPANY_MEMORY.md)이 초기화되었습니다.")
+
+        # 5. Messenger
+        elif choice == "5":
+            print("\n[💬 메신저(Telegram/Slack/Discord) 연결 설정 및 브릿지 시작]")
+            print("  1) 메신저 봇 토큰 설정 (.env)")
+            print("  2) 멀티 메신저 브릿지 즉시 시작")
+            print("  0) 이전 메뉴로")
+            sub = prompt_input("선택", "1")
+            if sub == "1":
+                env_vars = load_env_file(ENV_FILE)
+                env_vars["TELEGRAM_BOT_TOKEN"] = prompt_input(
+                    "Telegram Bot Token (@BotFather, 없으면 Enter)",
+                    env_vars.get("TELEGRAM_BOT_TOKEN", ""),
+                )
+                env_vars["TELEGRAM_ALLOWED_CHAT_IDS"] = prompt_input(
+                    "Telegram 허용 Chat ID (비워두면 첫 사용자 자동 등록)",
+                    env_vars.get("TELEGRAM_ALLOWED_CHAT_IDS", ""),
+                )
+                env_vars["SLACK_BOT_TOKEN"] = prompt_input(
+                    "Slack Bot Token (xoxb-..., 없으면 Enter)",
+                    env_vars.get("SLACK_BOT_TOKEN", ""),
+                )
+                env_vars["SLACK_CHANNEL_ID"] = prompt_input(
+                    "Slack Channel ID (없으면 Enter)",
+                    env_vars.get("SLACK_CHANNEL_ID", ""),
+                )
+                env_vars["DISCORD_BOT_TOKEN"] = prompt_input(
+                    "Discord Bot Token (없으면 Enter)",
+                    env_vars.get("DISCORD_BOT_TOKEN", ""),
+                )
+                env_vars["DISCORD_CHANNEL_ID"] = prompt_input(
+                    "Discord Channel ID (없으면 Enter)",
+                    env_vars.get("DISCORD_CHANNEL_ID", ""),
+                )
+                auto_en = []
+                if env_vars.get("TELEGRAM_BOT_TOKEN"):
+                    auto_en.append("telegram")
+                if env_vars.get("SLACK_BOT_TOKEN") or env_vars.get("SLACK_WEBHOOK_URL"):
+                    auto_en.append("slack")
+                if env_vars.get("DISCORD_BOT_TOKEN") or env_vars.get("DISCORD_WEBHOOK_URL"):
+                    auto_en.append("discord")
+                env_vars["ENABLED_MESSENGERS"] = ",".join(auto_en)
+                save_env_file(env_vars, ENV_FILE)
+                print(f"✅ .env 설정 저장 완료! (활성 메신저: {env_vars['ENABLED_MESSENGERS'] or '없음'})")
+            elif sub == "2":
+                cmd_gateway_start(argparse.Namespace(extra=[]))
+
+        # 6. Factory Reset
+        elif choice == "6":
+            cmd_reset(argparse.Namespace(yes=False, include_env=False))
+
 
 
 # =====================================================================
@@ -1305,6 +3139,44 @@ def build_parser() -> argparse.ArgumentParser:
     gws_parser = gw_sub.add_parser("start", help="메신저 브릿지 데몬 시작 (gateways/messenger_bridge.py)")
     gws_parser.add_argument("extra", nargs=argparse.REMAINDER, help="브릿지 스크립트에 전달할 추가 인자")
 
+    # 7. ui / dashboard (Web Control Console)
+    for ui_cmd in ("ui", "dashboard"):
+        ui_parser = subparsers.add_parser(
+            ui_cmd,
+            help="헤르메스 스타일 웹 관리 콘솔 UI 실행 (브라우저에서 스킬/팀/기억/메신저 클릭 관리)",
+        )
+        ui_parser.add_argument("--host", default="127.0.0.1", help="웹 콘솔 바인딩 호스트 (기본: 127.0.0.1)")
+        ui_parser.add_argument("--port", type=int, default=8765, help="웹 콘솔 포트 번호 (기본: 8765)")
+        ui_parser.add_argument("--no-browser", action="store_true", help="브라우저 자동 열기 비활성화")
+
+    # 8. menu / tui (Interactive Terminal Menu)
+    for menu_cmd in ("menu", "tui"):
+        subparsers.add_parser(
+            menu_cmd,
+            help="터미널 대화형 통합 제어 메뉴(TUI) 실행 (인자 없이 실행 시 기본 동작)",
+        )
+
+    # 9. reset (Clean State Reset)
+    reset_parser = subparsers.add_parser(
+        "reset",
+        help="모든 런타임 팀(teams/*), 장착 스킬(skills/*), 기억장을 비우고 순수 초기 상태(Clean State)로 리셋",
+    )
+    reset_parser.add_argument("--yes", "--force", "-y", dest="yes", action="store_true", help="확인 질문 없이 즉시 초기화")
+    reset_parser.add_argument("--include-env", "--reset-env", dest="include_env", action="store_true", help=".env 메신저 설정까지 함께 초기화")
+
+    # 10. status (alias for doctor) & role assign (compatibility alias)
+    subparsers.add_parser("status", help="시스템 상태 점검 (doctor와 동일)")
+
+    role_parser = subparsers.add_parser("role", help="창(Pane)에 표준 직책 프리셋 배정")
+    role_sub = role_parser.add_subparsers(dest="role_cmd", help="role 하위 명령")
+    ra_parser = role_sub.add_parser("assign", help="특정 창에 직책과 임무 부여")
+    ra_parser.add_argument("--pane", required=True, help="대상 창 ID (예: w1:p2)")
+    ra_parser.add_argument("--role", required=True, help="직책 이름 또는 코드")
+    ra_parser.add_argument("--agent", default="claude", help="사용할 AI 엔진")
+    ra_parser.add_argument("--mission", default="", help="핵심 임무 설명")
+    ra_parser.add_argument("--team", default=None, help="소속 부서 이름")
+    ra_parser.add_argument("--launch", action="store_true", help="배정 후 즉시 AI 실행")
+
     return parser
 
 
@@ -1312,9 +3184,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command is None or args.command in ("menu", "tui"):
+        return interactive_terminal_menu()
+    if args.command in ("ui", "dashboard"):
+        return cmd_ui(args)
+    if args.command == "reset":
+        return cmd_reset(args)
     if args.command == "setup":
         return cmd_setup(args)
-    if args.command == "doctor":
+    if args.command in ("doctor", "status"):
         return cmd_doctor(args)
     if args.command == "team":
         if args.team_cmd == "create":
@@ -1329,6 +3207,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.emp_cmd == "prompt":
             return cmd_employee_prompt(args)
         parser.parse_args(["employee", "--help"])
+        return 0
+    if args.command == "role":
+        if args.role_cmd == "assign":
+            mission = args.mission or f"{args.role}로서 배정된 과제를 수행하고 TEAM_MEMORY.md에 핵심 요약을 기록합니다."
+            assign_employee_to_pane(
+                pane_id=args.pane,
+                role_name=args.role,
+                agent_name=args.agent,
+                mission=mission,
+                team_name=args.team,
+                launch=bool(args.launch),
+            )
+            return 0
+        parser.parse_args(["role", "--help"])
         return 0
     if args.command == "skill":
         if args.skill_cmd == "list":

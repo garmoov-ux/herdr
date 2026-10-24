@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "herdr-agentic-os"
+version = "0.1.0"
+description = "Herdr × Hermes Self-Improving Multi-Team & Multi-Employee AgenticOS CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+herdr-os = "herdr_os:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["herdr_os.py", "control_ui.py", "gateways/", "scripts/", "templates/"]

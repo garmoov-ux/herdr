@@ -1,12 +1,27 @@
 # 보안 토큰 및 개인 설정 (절대 Git에 올라가지 않음)
-.env
-state.json
-scripts/state.json
+/.env
+/state.json
+/scripts/state.json
+/gateways/state.json
+
+# 초기 클론 시 깨끗한 0-상태 유지를 위한 사용자 런타임 데이터 무시
+# (웹 관리 콘솔 UI 또는 CLI를 통해 사용자가 직접 추가/생성)
+/teams/*
+!/teams/.gitkeep
+
+/skills/*
+!/skills/.gitkeep
+
+/memory/USER_PROFILE.md
+/memory/COMPANY_MEMORY.md
+!/memory/.gitkeep
 
 # 캡처 이미지 및 런타임 캐시
-captures/
+/captures/
 *.png
 *.jpg
 *.log
 __pycache__/
+*.pyc
+.venv/
 .DS_Store
